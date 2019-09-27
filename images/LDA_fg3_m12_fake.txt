@@ -1,0 +1,2 @@
+Counter	Image	Merger	Myr	Viewpoint	# Bulges	Sep	Flux Ratio	Gini	M20	C	A	S	Sersic n	A_s
+0	q0.5_fg0.3_allrx10_sunruns/hires_kin/broadband_170.fits	1	1.66	0	1	0	0	0.5351908503420719	-2.467120640930867	4.607420971174067	0.05271874197510022	0.001060814838360522	4.1504	0.3461207867839575

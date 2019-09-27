@@ -1,0 +1,17 @@
+#   1 NUMBER                 Running object number                                     
+#   2 X_IMAGE                Object position along x                                    [pixel]
+#   3 Y_IMAGE                Object position along y                                    [pixel]
+#   4 A_IMAGE                Profile RMS along major axis                               [pixel]
+#   5 B_IMAGE                Profile RMS along minor axis                               [pixel]
+#   6 FLUX_AUTO              Flux within a Kron-like elliptical aperture                [count]
+#   7 MAG_AUTO               Kron-like elliptical aperture magnitude                    [mag]
+#   8 FLUX_RADIUS            Fraction-of-light radii                                    [pixel]
+#   9 PETRO_RADIUS           Petrosian apertures in units of A or B                    
+#  10 KRON_RADIUS            Kron apertures in units of A or B                         
+#  11 FLUX_PETRO             Flux within a Petrosian-like elliptical aperture           [count]
+#  12 FLAGS                  Extraction flags                                          
+#  13 THETA_IMAGE            Position angle (CCW/x)                                     [deg]
+#  14 BACKGROUND             Background at centroid position                            [count]
+#  15 FLUX_APER              Flux vector within fixed circular aperture(s)              [count]
+#  16 FLUXERR_APER           RMS error vector for aperture flux(es)                     [count]
+         1    101.4331    101.1677    14.553    11.916     242607.8 -13.4623     12.313  3.96  3.50     250567.7   0  -5.39     1.802448     36674.72     25.17858
