@@ -1,29 +1,32 @@
 
 '''
 
-GalaxySmelter - This is the 'Real' edition to be applied to a real galaxy survey to extract predictors and place them in a table.
+GalaxySmelter - This is the 'Fake' edition to be applied to the simulated galaxy images to extract predictors and place them in a table.
 
-Things to install: Source Extractor, Galfit, statmorph (cite Vicente Rodriguez-Gomez)
+Things to install: Source Extractor, Galfit, statmorph (cite Vicente Rodriguez-Gomez and all the other appropriate developers please)
 
-The first step is to determine how to obtain galaxy images, ivar images, and psf; here I show an example for MaNGA preimaging,
-utilizing wget - you can make your own directory that contains files, ivar files, and psfs, just name them camera_data, camera_data_ivar,
-and psf, respectively.
+The first step is to to obtain the images, which I extract from extensions of the broadband.fits files that are the output from SUNRISE.
 
-These images need to be in units of counts.
+The next step is to create mock images, I am creating mock SDSS r-band images. This code also contains methods to artificially dim or redshift these images, which I have used in Nevin et al. 2019 in order to test on which magnitude and which redshifts of SDSS imaging this techinque can be applied to.
 
-Here, I run everything from within a folder that has subfolders imaging/ and preim/
-which contain the output check images and the input images, respectively.
+These images need to be in units of counts, so this code also converts into these.
+
+It clips the images to the appropriate size, convolves and rebins, introduces residual background noise, and creates an error image.
+
+Then, the pipeline extracts various imaging predictors. The final output is a table which can be used as a direct input to the LDA code that creates the classification.
+
 '''
 
 '''
 Import things, these first few lines are so that this version of python plays nicely with plotting on the supercomputer
 '''
-import shlex
-import subprocess
 import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.pyplot as plt
 plt.ioff()
+
+import shlex
+import subprocess
 import os
 import numpy as np
 from scipy import ndimage
@@ -38,18 +41,17 @@ import scipy.optimize as opt
 from astropy.cosmology import WMAP9 as cosmo
 from astropy.convolution import Gaussian2DKernel
 from astropy.convolution import convolve
-from astropy.io import fits
 import math
 import photutils
 import statmorph
 from skimage import measure
-
-'''imports a million things'''
-import pyfits
+import astropy.io.fits as pyfits #pyfits is deprecated
 from photutils import CircularAperture,aperture_photometry
+from astropy.cosmology import FlatLambdaCDM
 
-'''This code block reads in the broadband images and then will open the broadband extension,
-...
+
+'''
+This function reads in the broadband images and then will open the appropriate broadband extensions
 '''
 def produce_camera(img, viewpoint):
     im=pyfits.open(img)
@@ -57,10 +59,13 @@ def produce_camera(img, viewpoint):
     camera_data=im['CAMERA'+str(viewpoint)+'-BROADBAND'].data
     pixelscale =  im['CAMERA'+str(viewpoint)+'-BROADBAND'].header['CD1_1']
 
-    
+    # pixelscale is in kpc units
     
     return pixelscale, camera_data
 
+'''
+Applies a low pass filter and determines the peaks of the image
+'''
 def determine_coords(img):
     
     '''Apply a 10x10 kernal to the image to filter out noise (its basically a low pass filter)
@@ -160,11 +165,7 @@ def fit_2_gaussian(x_1,y_1,x_2,y_2, data):
         popt=[0,0,0,0,0,0,0,0,0,0,0,0,0]
         fit='no'
         #flag for if the fit failed
-
-
- 
-
-    
+   
     
     return popt[1], popt[2], popt[8], popt[9], popt[0], popt[7], np.sqrt(popt[3]**2+popt[4]**2), np.sqrt(popt[10]**2+popt[11]**2), fit 
 
@@ -190,7 +191,9 @@ def twoD_two_Gaussian(xdata_tuple, amplitude, xo, yo, sigma_x, sigma_y, theta, o
     
     return g.ravel()
 
-
+'''
+Determines the brighter of the two peaks in order to center on this location.
+'''
 def determine_brighter(img, x, y, x2, y2, pix, redshift):
     kpc_arcmin=cosmo.kpc_proper_per_arcmin(redshift)#insert the redshift to get the kpc/arcmin scaling
 
@@ -215,7 +218,11 @@ def determine_brighter(img, x, y, x2, y2, pix, redshift):
     
     return total_light_1, total_light_2
 
-
+'''
+Clips the image in a square around the center that is as large as possible (up to 80")
+The miniumum cutout size is 50"
+This can be adjusted for different surveys.
+'''
 def clip_image(ins, pixelscale, redshift, xcen, ycen):
  
     kpc_arcmin=cosmo.kpc_proper_per_arcmin(redshift)#insert the redshift  
@@ -228,22 +235,12 @@ def clip_image(ins, pixelscale, redshift, xcen, ycen):
     min_pix_size = min([xcen,ycen,300-xcen,300-ycen])
     arc_size = int(min_pix_size*size_a)
     num_pix_half=int(arc_size/size_a)#was 25, arc_size
-    '''50" per side'''
-    
-    
-    
-    
-    
-    
-    
-    
- 
-    
     
     
     if xcen-num_pix_half < 0 or ycen-num_pix_half < 0 or xcen+num_pix_half > 300 or ycen+num_pix_half > 300 or num_pix_half==0:
-        print('Outside of the box')
-        clipped=0#(ins[xcen-num_pix_half:xcen+num_pix_half,ycen-num_pix_half:ycen+num_pix_half])#0
+        print('Outside of the box')# If the galaxy is outside of the box something went wrong with the centering (in SUNRISE)
+                                   # of this snapshot and you shouldn't use it
+        clipped=0
         tag='no'
     
     else:
@@ -255,59 +252,43 @@ def clip_image(ins, pixelscale, redshift, xcen, ycen):
     return clipped, size_a, num_pix_half, tag, xcen, ycen, arc_size
 
 
-'''Now I have to convert the units of LAURAS sims into nanomaggies and AB mags (mags of DR7 and DR13)
 '''
-def nanomags(z, pixscale, camera_data, view, number):
+This function converts from the units of SUNRISE (W/m/m^2/sr) into nanomaggies and AB mags (mags of DR7 and DR13),
+which is a huge pain in the butt.
+'''
+def nanomags(z, pixelscale, camera_data, view, number):
 
     c = 299792.458*1000#to get into m/s
 
  
 
-    pixelscale=pixscale
-
-    from astropy.cosmology import FlatLambdaCDM
     cosmo = FlatLambdaCDM(H0=70, Om0=0.3)
     
     d_A = cosmo.comoving_distance(z).value/(1+z)
+    # I use the angular diameter distsance, which is the ratio of the galaxy's physical transverse size to its angular size
     
-    '''Alternate way'''
-    '''import cosmolopy.distance as cd
-    cosmo = {'omega_M_0' : 0.3, 'omega_lambda_0' : 0.7, 'h' :0.72}
-    cosmo = cd.set_omega_k_0(cosmo)
+    # Here's a good review of all the different distances cosmology distances:
+    # http://www.astro.ufl.edu/~guzman/ast7939/projects/project01.html
+
+    # Convert from specific intensity units (W/m/m^2/sr) from SUNRISE to Janskies (W/Hz/m^2), which is a flux density,
+    # it is necessary to integrate the specific intensity over d Omega, or the entire solid angle:
+    # S_nu (Jy) = int(I_nu d Omega) --> however, I is currently I_lambda so first we need to go from I_lambda to I_nu
+    Janskies=np.array(10**(26)*camera_data*np.pi*(pixelscale/(1000*d_A))**2*((6185.2*10**(-10))**2/c), dtype='>f4')#*np.pi*((6185.2*10**(-10))**2/c),
+    # A Jansky is 10^-26 W/m^2/Hz so the 10**26 factor is to go from W/Hz/m^2 to Jy
     
-    d_a = cd.angular_diameter_distance(z, **cosmo)
-    print('angular diameter distance', d_a)'''
+    # The next step is to integrate over d Omega, which can be approximated with S_nu = I_nu * pi * (the angular radius of the galaxy as viewed from Earth in radians)^2
+    # multiply by pi * (rad of galaxy / distance to galaxy) [small angle approximation]
+    # the radius of the galaxy (or pixel in our case) is divided by the angular distance to the galaxy (both in kpc) and squared
     
-    #here's a good review of all the different distances cosmology distances:
-    #http://www.astro.ufl.edu/~guzman/ast7939/projects/project01.html
-
-    #Convert from specific intensity units (W/m/m^2/sr) from SUNRISE to Janskies (W/Hz/m^2): 
-    Janskies=np.array(10**(26)*camera_data*(pixelscale/(1000*d_A))**2*((6185.2*10**(-10))**2/c), dtype='>f4')#*np.pi*((6185.2*10**(-10))**2/c),
-    #this 1.35e-6 comes from the arcsin(R_sky/Distance to object)
-    #the answer needs to be in radians
-
-
+    # To go from I_nu to I_lambda use this: dnu = dlambda*c/lambda^2, so I_nu = lambda*I_lambda / (nu)
+    # I use I_nu = lambda*2/c * I_lambda, be careful since c is in m/s
+    # I use the central wavelength of the red channel in MaNGA which is around 6185.2A
     
+    # reference site: http://www.cv.nrao.edu/course/astr534/Brightness.html
     
-
-    #J=10^-26 W/m^2/Hz, so units of flux density
-    #reference site: http://www.cv.nrao.edu/course/astr534/Brightness.html
-    #We need to go from a spectral brightness (I_nu) which is in m units
-    #To a flux density (S_nu) which is in units of Janskies (W/m^2/Hz)
-
-    #So you need to multiply the Fν by c / λ^2 to convert it into Fλ. 
-    #But we are not done yet! Recalling from above, the units of Fλ 
-    #are not an energy density. You need to get another factor of λ 
-    #in there to make the units work out to be energy density: 
-    #calculate λFλ to get units of ergs/s/cm^2.
-
-    
-    #zero-point flux density is 3631 Jy
-
- #*15.8#/(1+z)**5
- #Then convert from this to a magnitude: m = [22.5 mag] − 2.5 log 10 f
-    
-
+    # SDSS uses a bunch of different magnitude systems, we are trying to convert to counts,
+    # there are conversions (see below) on the frame images that convert nanomaggies to counts, so we first need to go to nanomatties:
+    # the zero-point flux density is 3631 Jy for SDSS, meaning that a magnitude 0 object has a flux of 3631 Jy:
     m = - 2.5*np.log10(abs(Janskies) / 3631)
     
 
@@ -315,13 +296,10 @@ def nanomags(z, pixscale, camera_data, view, number):
 
     
 
-    
-    
-    
-    '''Lets say I want everything to be 20th mag in order to test if this is the same result as everything varying'''
+    # This section is to optionally scale the brightness of the images ie if you want to test the magnitude limit the classification works for.
     scaling = m.min()-20
     
-    Janskies_bright = Janskies*100**(1/5)
+    Janskies_bright = Janskies#*100**(1/5)
 
     m =  - 2.5*np.log10(abs(Janskies_bright) / 3631)
 
@@ -329,7 +307,7 @@ def nanomags(z, pixscale, camera_data, view, number):
     
     
  
-    '''plt.clf()
+    plt.clf()
     fig=plt.figure()
     ax1=fig.add_subplot(211)
     
@@ -345,7 +323,8 @@ def nanomags(z, pixscale, camera_data, view, number):
     im2=ax2.imshow(m_asinh,cmap='afmhot_r')#,
     plt.title(str(round(m_asinh.min(),2)))
     plt.colorbar(im2, label='r-band apparent magnitude') 
-    plt.savefig('../MaNGA_Papers/Paper_I/app_mags_'+str(view)+'_'+str(number)+'.png')'''
+    plt.savefig('check_mags/app_mags_'+str(run)+'_'+str(view)+'_'+str(number)+'.png')
+    
     
     
     nanomaggy=(Janskies_bright/(3.631*10**(-6)))
@@ -380,7 +359,7 @@ def nanomags(z, pixscale, camera_data, view, number):
     '''The sky resids are given by:''' 
     sky_resids_mine=cimg*np.random.normal(0.331132,5.63218,shape(nanomaggy))
     sky_resids_mine_counts=np.random.normal(0.331132,5.63218,shape(nanomaggy))
-    d_image=(nanomaggy)#/10#+sky_resids_mine
+    d_image=(nanomaggy)# Do not add in the backgrounds yet
     degraded_image=d_image
     degraded_image_counts=d_image/cimg#will use this one in the future
     
@@ -436,7 +415,7 @@ def convolve_rebin_image(number, z, pixscale, view, counts, t_exp, size):#all of
     '''Try to cut down sky_resids_mine_counts'''
     sky_resids_mine_counts_cutout=sky_resids_mine_counts[indent:indent+np.shape(rebin)[0],indent:indent+np.shape(rebin)[0]]
     
-    '''plt.clf()
+    plt.clf()
     fig=plt.figure()
     ax1=fig.add_subplot(211)
     im1=ax1.imshow(rebin, norm=matplotlib.colors.LogNorm())
@@ -445,7 +424,7 @@ def convolve_rebin_image(number, z, pixscale, view, counts, t_exp, size):#all of
     ax2=fig.add_subplot(212)
     im2=ax2.imshow(abs(padded+sky_resids_mine_counts), norm=matplotlib.colors.LogNorm())
     plt.colorbar(im2)
-    plt.savefig('padded.pdf')'''
+    plt.savefig('padded.pdf')
     
     
    
@@ -460,7 +439,7 @@ def convolve_rebin_image(number, z, pixscale, view, counts, t_exp, size):#all of
 
     import seaborn as sns
     sns.set_style('dark')
-    '''plt.clf()
+    plt.clf()
     fig, axes = plt.subplots(ncols=4,nrows=2, figsize=(10,4))
     fig.subplots_adjust(hspace=0.4, wspace=0.4)
 
@@ -501,7 +480,7 @@ def convolve_rebin_image(number, z, pixscale, view, counts, t_exp, size):#all of
 
     
 
-    SDSS_image = pyfits.open('../MergerMonger/imaging/pet_radius_587727225690194001.fits')
+    SDSS_image = pyfits.open('/Users/beckynevin/Clone_Docs_old_mac/Backup_My_Book/My_Passport_backup/MergerMonger/imaging/pet_radius_587727225690194001.fits')
     #587727225690194001
 
     im4 = axes.flat[7].imshow(SDSS_image[0].data, cmap='afmhot', norm=matplotlib.colors.LogNorm(vmin=10**(0), vmax=10**4))
@@ -561,52 +540,11 @@ def convolve_rebin_image(number, z, pixscale, view, counts, t_exp, size):#all of
 
     cbar2.ax.tick_params(labelsize=10)
     cbar2.set_label('Counts', size=10)
-    plt.savefig('mock_images_rebin.pdf')
-
-
-
-
-
-
-    plt.clf()
-    fig, axes = plt.subplots(ncols=3,nrows=1, figsize=(9,3))
-
-
-    #ax = fig.add_subplot(2,4,1)
-    masked = np.ma.masked_where(abs(counts_OG) < 10**0, abs(counts_OG))
-    
-    
-    im = axes.flat[0].imshow(masked.filled(fill_value=1), cmap='afmhot', norm=matplotlib.colors.LogNorm(vmin=10**0, vmax=10**4))
-    axes.flat[0].set_title(r'Simulated Image', size=17, color='white')
-    #axes.flat[0].annotate('Simulated Image', size=12, color='white', xy=(0.05,0.9), xycoords='axes fraction')
-    
-    im1 = axes.flat[1].imshow(abs(sky_resids_mine_counts+rebin), cmap='afmhot', norm=matplotlib.colors.LogNorm(vmin=10**0, vmax=10**4))
-    axes.flat[1].set_title('Mock SDSS Image', size=17, color='white')
-        #axes.flat[1].annotate('Mock SDSS Image', size=12, color='white', xy=(0.05,0.9), xycoords='axes fraction')
-    #axes.flat[3].annotate('4',size=17, color='white', xy=(0.03,0.84), xycoords='axes fraction')
-    #plt.colorbar(im3)
-    
-
+    plt.savefig('check_mags/mock_images_rebin_'+str(run)+'_'+str(viewpt)+'_'+str(number)+'.png')
 
     
 
-    SDSS_image = pyfits.open('../MergerMonger/imaging/pet_radius_587728669878845746.fits')##587727225690194001
-    #587727225690194001
 
-    im2 = axes.flat[2].imshow(SDSS_image[0].data, cmap='afmhot', norm=matplotlib.colors.LogNorm(vmin=10**(0), vmax=10**4))
-    axes.flat[2].set_title('Actual SDSS Image', size=17, color='white')
-    #axes.flat[2].annotate('SDSS Image', size=12, color='white', xy=(0.05,0.9), xycoords='axes fraction')
-
-    axes.flat[0].axis('off')
-
-    axes.flat[1].axis('off')
-
-    axes.flat[2].axis('off')
-    #plt.tight_layout()
-    plt.subplots_adjust(hspace=0.1, wspace=0.1)
-    plt.rcParams['axes.facecolor']='black'
-    plt.rcParams['savefig.facecolor']='black'
-    plt.savefig('three.png')'''
     
     
 
@@ -2160,23 +2098,6 @@ merger_sim=['fg1_m_13']
 
 
 
-img_list=['q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_235.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_237.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_240.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_242.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_245.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_247.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_250.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_252.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_255.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_257.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_262.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_265.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_270.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_275.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_280.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_285.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_287.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_288.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_289.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_290.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_295.fits','q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_300.fits',
-          'q0.333_fg0.3_allrx10_sunruns/hires_kin_late/broadband_305.fits']
-myr=[235,237,240,242,245,247,250,252,255,257,262,265,270,275,280,285,287,288,289,290,295,300,305]
-merger=[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
-merger_sim=['fg1_m_13','fg1_m_13','fg1_m_13',
-            'fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13','fg1_m_13',
-           'fg1_m_13','fg1_m_13']
 
 
 
@@ -2300,6 +2221,11 @@ merger_sim=['fg3_m_15','fg3_m_15','fg3_m_15','fg3_m_15','fg3_m_15',
 
 
 
+
+
+
+
+
 run='isolated'
 
 img_list=['isolated_galaxies/m0.5_fg0.3/broadband_005.fits','isolated_galaxies/m0.5_fg0.3/broadband_010.fits','isolated_galaxies/m0.5_fg0.3/broadband_030.fits',
@@ -2330,6 +2256,59 @@ merger=[0,0,0,0,0,0,
        0,0,0,0,0,0,0,0,0,0,
        0,0,0,0,0,0,0,0,0,0,
        0,0,0,0,0]
+       
+       
+img_list=['q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_020.fits',
+    'q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_040.fits',
+        'q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_070.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_080.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_100.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_120.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin_early_cen1/broadband_140.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_150.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_170.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_180.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_190.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_210.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_220.fits',
+         'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_230.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_235.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_237.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_240.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_242.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_245.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_247.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_250.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_252.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_255.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_257.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_262.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_265.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_270.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_275.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_280.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_285.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_287.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_288.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_289.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_290.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_295.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_300.fits',
+          'q0.333_fg0.3_allrx10_sunruns/hires_kin/broadband_305.fits']
+
+myr=[20,40,70,80,100,120,140,150,170,180,190,210,220,230,235,237,
+     240,242,245,247,250,252,255,257,262,265,270,275,280,285,
+     287,288,289,290,295,300,305]
+merger=[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1]
+merger_sim=['fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13',
+            'fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13',
+            'fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13',
+            'fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13','fg3_m_13']
+
+
+
 
 img_list=['q0.5_fg0.3_allrx10_sunruns/hires_kin/broadband_170.fits','q0.5_fg0.3_allrx10_sunruns/hires_kin/broadband_180.fits',
     'q0.5_fg0.3_allrx10_sunruns/hires_kin/broadband_185.fits','q0.5_fg0.3_allrx10_sunruns/hires_kin/broadband_190.fits',
@@ -2366,7 +2345,7 @@ merger_sim=['fg3_m12','fg3_m12','fg3_m12','fg3_m12',
            'fg3_m12','fg3_m12','fg3_m12','fg3_m12',
            'fg3_m12','fg3_m12','fg3_m12','fg3_m12']
            
-           
+
 
 
            
@@ -2385,7 +2364,7 @@ if len(img_list) != len(myr) or len(img_list) != len(merger) or len(img_list) !=
     stop
 viewpts=[0,1,2,3,4,5,6]
 
-file2=open('/Users/beckynevin/CfA_Code/Kinematics_SUNRISE/images_old/LDA_fg3_m12_diff.txt','w')
+file2=open('/Users/beckynevin/CfA_Code/Kinematics_SUNRISE/images_old/LDA_'+str(run)+'_old.txt','w')
 
 
 counter=0
@@ -2742,7 +2721,7 @@ for k in range(len(viewpts)):
             #sometimes Galfit fails and you need to move on with your life.
             #It should really work for the majority of cases though.
             print('Galfit failed', viewpt,myr[i])
-            STOP
+            
             continue
         try:
             
